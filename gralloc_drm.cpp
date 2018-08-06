@@ -180,7 +180,10 @@ static struct gralloc_drm_bo_t *validate_handle(buffer_handle_t _handle,
 		ALOGD_IF(RK_DRM_GRALLOC_DEBUG,"handle: name=%d pfd=%d\n", handle->name,handle->prime_fd);
 		/* create the struct gralloc_drm_bo_t locally */
 		if (handle->name || handle->prime_fd >= 0)
-			bo = drm->drv->alloc(drm->drv, handle);
+		{
+			//bo = drm->drv->alloc(drm->drv, handle);
+			bo = drm_gem_rockchip_alloc(drm->drv, handle);
+		}
 		else /* an invalid handle */
 			bo = NULL;
 		if (bo) {
@@ -318,6 +321,8 @@ struct gralloc_drm_bo_t *gralloc_drm_bo_create(struct gralloc_drm_t *drm,
 
 	handle->data_owner = gralloc_drm_get_pid();
 	handle->data = bo;
+    handle->consumer_usage = usage;
+    handle->producer_usage = usage;
 	handle->ref = 0;
 
 	return bo;
@@ -335,7 +340,8 @@ static void gralloc_drm_bo_destroy(struct gralloc_drm_bo_t *bo)
 	if (bo->refcount)
 		return;
 
-	bo->drm->drv->free(bo->drm->drv, bo);
+//	bo->drm->drv->free(bo->drm->drv, bo);
+	drm_gem_rockchip_free(NULL, bo);
 	if (imported) {
 		handle->data_owner = 0;
 		handle->data = 0;

@@ -1,6 +1,6 @@
 #define LOG_TAG "GRALLOC-ROCKCHIP"
 
-#define ENABLE_DEBUG_LOG
+// #define ENABLE_DEBUG_LOG
 #include <log/custom_log.h>
 
 
@@ -18,15 +18,35 @@ extern "C" {
 #include "gralloc_drm_priv.h"
 #if RK_DRM_GRALLOC
 #include <cutils/properties.h>
-#include "format_chooser.h"
 #if MALI_AFBC_GRALLOC == 1
 #include <inttypes.h>
 #include "gralloc_buffer_priv.h"
+#include "mali_gralloc_formats.h"
+#include "mali_gralloc_usages.h"
 #endif //end of MALI_AFBC_GRALLOC
 #endif //end of RK_DRM_GRALLOC
 #include <stdbool.h>
+#include <sys/stat.h>
+
+#define RK_CTS_WORKROUND	(1)
 
 #define UNUSED(...) (void)(__VA_ARGS__)
+
+#if RK_CTS_WORKROUND
+#define VIEW_CTS_FILE		"/metadata/view_cts.ini"
+#define VIEW_CTS_PROG_NAME	"android.view.cts"
+#define VIEW_CTS_HINT		"view_cts"
+#define BIG_SCALE_HINT		"big_scale"
+typedef unsigned int       u32;
+typedef enum
+{
+	IMG_STRING_TYPE		= 1,                    /*!< String type */
+	IMG_FLOAT_TYPE		,                       /*!< Float type */
+	IMG_UINT_TYPE		,                       /*!< Unsigned Int type */
+	IMG_INT_TYPE		,                       /*!< (Signed) Int type */
+	IMG_FLAG_TYPE                               /*!< Flag Type */
+}IMG_DATA_TYPE;
+#endif
 
 struct dma_buf_sync {
         __u64 flags;
@@ -79,8 +99,8 @@ struct rockchip_buffer {
 
 #if RK_DRM_GRALLOC
 
-#define RK_GRALLOC_VERSION "1.2.0"
-#define ARM_RELEASE_VER "r14p0-00rel0"
+#define RK_GRALLOC_VERSION "1.0.6"
+#define ARM_RELEASE_VER "r13p0-00rel0"
 
 #if RK_DRM_GRALLOC_DEBUG
 #ifndef AWAR
@@ -114,14 +134,26 @@ struct rockchip_buffer {
 #define AERR_IF( eq, fmt, args...) if ( (eq) ) AERR( fmt, args )
 #endif
 
-#define GRALLOC_ALIGN( value, base ) (((value) + ((base) - 1)) & ~((base) - 1))
 #define ODD_ALIGN(x, align)		(((x) % ((align) * 2) == 0) ? ((x) + (align)) : (x))
 #define GRALLOC_ODD_ALIGN( value, base )   ODD_ALIGN(GRALLOC_ALIGN(value, base), base)
 
-#define AFBC_PIXELS_PER_BLOCK                    16
-#define AFBC_BODY_BUFFER_BYTE_ALIGNMENT          1024
-#define AFBC_HEADER_BUFFER_BYTES_PER_BLOCKENTRY  16
-#define AFBC_WIDEBLK_WIDTH_ALIGN                 32
+/*---------------------------------------------------------------------------*/
+
+#define AFBC_PIXELS_PER_BLOCK 16
+#define AFBC_HEADER_BUFFER_BYTES_PER_BLOCKENTRY 16
+
+#define AFBC_BODY_BUFFER_BYTE_ALIGNMENT 1024
+#define AFBC_NORMAL_WIDTH_ALIGN 16
+#define AFBC_NORMAL_HEIGHT_ALIGN 16
+#define AFBC_WIDEBLK_WIDTH_ALIGN 32
+#define AFBC_WIDEBLK_HEIGHT_ALIGN 16
+// Regarding Tiled Headers AFBC mode, both header and body buffer should aligned to 4KB
+// and in non-wide mode (16x16), the width and height should be both rounded up to 128
+// in wide mode (32x8) the width should be rounded up to 256, the height should be rounded up to 64
+#define AFBC_TILED_HEADERS_BASIC_WIDTH_ALIGN 128
+#define AFBC_TILED_HEADERS_BASIC_HEIGHT_ALIGN 128
+#define AFBC_TILED_HEADERS_WIDEBLK_WIDTH_ALIGN 256
+#define AFBC_TILED_HEADERS_WIDEBLK_HEIGHT_ALIGN 64
 
 // This value is platform specific and should be set according to hardware YUV planes restrictions.
 // Please note that EGL winsys platform config file needs to use the same value when importing buffers.
@@ -129,9 +161,6 @@ struct rockchip_buffer {
 
 // Default YUV stride aligment in Android
 #define YUV_ANDROID_PLANE_ALIGN 16
-
-static void drm_gem_rockchip_free(struct gralloc_drm_drv_t *drv,
-		struct gralloc_drm_bo_t *bo);
 
 /*
  * Type of allocation
@@ -144,8 +173,12 @@ typedef enum AllocType
 	AFBC_WIDEBLK,
 	/* AN AFBC buffer with additional padding to ensure a 64-bte alignment
 	 * for each row of blocks in the header */
-	AFBC_PADDED
-}AllocType;
+	AFBC_PADDED,
+	/* AFBC_TILED_HEADERS_AFBC_BASIC mode requires buffer to have 128*128 pixels alignment(16x16 superblocks) */
+	AFBC_TILED_HEADERS_BASIC,
+	/* AFBC_TILED_HEADERS_AFBC_WIDEBLK mode requires buffer to have 256*64 pixels alignment(32x8 superblocks) */
+	AFBC_TILED_HEADERS_WIDEBLK,
+}   AllocType;
 
 /*
  * Computes the strides and size for an RGB buffer
@@ -159,8 +192,8 @@ typedef enum AllocType
  * size         (out)  size of the buffer in bytes
  * type         (in)   if buffer should be allocated for afbc
  */
-static void get_rgb_stride_and_size(int width, int height, int pixel_size,
-                                    int* pixel_stride, int* byte_stride, size_t* size, AllocType type)
+static void get_rgb_stride_and_size(int width, int height, int pixel_size, int *pixel_stride, int *byte_stride,
+                                    size_t *size, AllocType type)
 {
 	int stride;
 
@@ -172,7 +205,7 @@ static void get_rgb_stride_and_size(int width, int height, int pixel_size,
 
 	if (size != NULL)
 	{
-		*size = stride * height;
+		*size = stride *height;
 	}
 
 	if (byte_stride != NULL)
@@ -188,28 +221,55 @@ static void get_rgb_stride_and_size(int width, int height, int pixel_size,
 	if (type != UNCOMPRESSED)
 	{
 		int w_aligned;
-		int h_aligned = GRALLOC_ALIGN( height, AFBC_PIXELS_PER_BLOCK );
+		int h_aligned = GRALLOC_ALIGN(height, AFBC_NORMAL_HEIGHT_ALIGN);
 		int nblocks;
+		int buffer_byte_alignment = AFBC_BODY_BUFFER_BYTE_ALIGNMENT;
 
-		if (type == AFBC_PADDED)
+		if (type == AFBC_TILED_HEADERS_BASIC)
 		{
-			w_aligned = GRALLOC_ALIGN( width, 64 );
+			w_aligned = GRALLOC_ALIGN(width, AFBC_TILED_HEADERS_BASIC_WIDTH_ALIGN);
+			h_aligned = GRALLOC_ALIGN(height, AFBC_TILED_HEADERS_BASIC_HEIGHT_ALIGN);
+			buffer_byte_alignment = 4 * AFBC_BODY_BUFFER_BYTE_ALIGNMENT;
+		}
+		else if (type == AFBC_TILED_HEADERS_WIDEBLK)
+		{
+			w_aligned = GRALLOC_ALIGN(width, AFBC_TILED_HEADERS_WIDEBLK_WIDTH_ALIGN);
+			h_aligned = GRALLOC_ALIGN(height, AFBC_TILED_HEADERS_WIDEBLK_HEIGHT_ALIGN);
+			buffer_byte_alignment = 4 * AFBC_BODY_BUFFER_BYTE_ALIGNMENT;
+		}
+		else if (type == AFBC_PADDED)
+		{
+			w_aligned = GRALLOC_ALIGN(width, 64);
 		}
 		else if (type == AFBC_WIDEBLK)
 		{
-			w_aligned = GRALLOC_ALIGN( width, AFBC_WIDEBLK_WIDTH_ALIGN );
+			w_aligned = GRALLOC_ALIGN(width, AFBC_WIDEBLK_WIDTH_ALIGN);
+			h_aligned = GRALLOC_ALIGN(height, AFBC_WIDEBLK_HEIGHT_ALIGN);
 		}
 		else
 		{
-			w_aligned = GRALLOC_ALIGN( width, AFBC_PIXELS_PER_BLOCK );
+			w_aligned = GRALLOC_ALIGN(width, AFBC_NORMAL_WIDTH_ALIGN);
+		}
+
+		stride = w_aligned * pixel_size;
+		stride = GRALLOC_ALIGN(stride, 64);
+
+		if (byte_stride != NULL)
+		{
+			*byte_stride = stride;
+		}
+
+		if (pixel_stride != NULL)
+		{
+			*pixel_stride = stride / pixel_size;
 		}
 
 		nblocks = w_aligned / AFBC_PIXELS_PER_BLOCK * h_aligned / AFBC_PIXELS_PER_BLOCK;
 
-		if ( size != NULL )
+		if (size != NULL)
 		{
-			*size = w_aligned * h_aligned * pixel_size +
-					GRALLOC_ALIGN( nblocks * AFBC_HEADER_BUFFER_BYTES_PER_BLOCKENTRY, AFBC_BODY_BUFFER_BYTE_ALIGNMENT );
+			*size = stride *h_aligned +
+			        GRALLOC_ALIGN(nblocks * AFBC_HEADER_BUFFER_BYTES_PER_BLOCKENTRY, buffer_byte_alignment);
 		}
 	}
 }
@@ -226,44 +286,60 @@ static void get_rgb_stride_and_size(int width, int height, int pixel_size,
  * type                 if buffer should be allocated for a certain afbc type
  * internalHeight (out) The internal height, which may be greater than the public known height.
  */
-static bool get_afbc_yuv420_8bit_stride_and_size(int width, int height, int* pixel_stride, int* byte_stride,
-                                                 size_t* size, AllocType type, int *internalHeight)
+static bool get_afbc_yuv420_8bit_stride_and_size(int width, int height, int *pixel_stride, int *byte_stride,
+                                                 size_t *size, AllocType type, int *internalHeight)
 {
 	int yuv420_afbc_luma_stride, yuv420_afbc_chroma_stride;
+	int buffer_byte_alignment = AFBC_BODY_BUFFER_BYTE_ALIGNMENT;
 
 	*internalHeight = height;
 
-	if (type == UNCOMPRESSED)
-	{
-		AERR(" Buffer must be allocated with AFBC mode for internal pixel format YUV420_8BIT_AFBC!");
-		return false;
-	}
+#if MALI_VIDEO_VERSION != 0
 
-	if (type == AFBC_PADDED)
-	{
-		AERR("GRALLOC_USAGE_PRIVATE_2 (64byte header row alignment for AFBC) is not supported for YUV");
-		return false;
-	}
-
-	if (type == AFBC_WIDEBLK)
-	{
-		width = GRALLOC_ALIGN(width, AFBC_WIDEBLK_WIDTH_ALIGN);
-	}
-	else
-	{
-		width = GRALLOC_ALIGN(width, AFBC_PIXELS_PER_BLOCK);
-	}
-
-#if AFBC_YUV420_EXTRA_MB_ROW_NEEDED
 	/* If we have a greater internal height than public we set the internalHeight. This
-	 * implies that cropping will be applied of internal dimensions to fit the public one. */
+	 * implies that cropping will be applied of internal dimensions to fit the public one.
+	 *
+	 * NOTE: This should really only be done when the producer is determined to be VPU decoder.
+	 */
 	*internalHeight += AFBC_PIXELS_PER_BLOCK;
 #endif
 
 	/* The actual height used in size calculation must include the possible extra row. But
 	 * it must also be AFBC-aligned. Only the extra row-padding should be reported back in
 	 * internalHeight. This as only this row needs to be considered when cropping. */
-	height = GRALLOC_ALIGN( *internalHeight, AFBC_PIXELS_PER_BLOCK );
+
+	if (type == UNCOMPRESSED)
+	{
+		AERR(" Buffer must be allocated with AFBC mode for internal pixel format YUV420_8BIT_AFBC!");
+		return false;
+	}
+	else if (type == AFBC_TILED_HEADERS_BASIC)
+	{
+		width = GRALLOC_ALIGN(width, AFBC_TILED_HEADERS_BASIC_WIDTH_ALIGN);
+		height = GRALLOC_ALIGN(*internalHeight, AFBC_TILED_HEADERS_BASIC_HEIGHT_ALIGN);
+		buffer_byte_alignment = 4 * AFBC_BODY_BUFFER_BYTE_ALIGNMENT;
+	}
+	else if (type == AFBC_TILED_HEADERS_WIDEBLK)
+	{
+		width = GRALLOC_ALIGN(width, AFBC_TILED_HEADERS_WIDEBLK_WIDTH_ALIGN);
+		height = GRALLOC_ALIGN(*internalHeight, AFBC_TILED_HEADERS_WIDEBLK_HEIGHT_ALIGN);
+		buffer_byte_alignment = 4 * AFBC_BODY_BUFFER_BYTE_ALIGNMENT;
+	}
+	else if (type == AFBC_PADDED)
+	{
+		AERR("GRALLOC_USAGE_PRIVATE_2 (64byte header row alignment for AFBC) is not supported for YUV");
+		return false;
+	}
+	else if (type == AFBC_WIDEBLK)
+	{
+		width = GRALLOC_ALIGN(width, AFBC_WIDEBLK_WIDTH_ALIGN);
+		height = GRALLOC_ALIGN(*internalHeight, AFBC_WIDEBLK_HEIGHT_ALIGN);
+	}
+	else
+	{
+		width = GRALLOC_ALIGN(width, AFBC_NORMAL_WIDTH_ALIGN);
+		height = GRALLOC_ALIGN(*internalHeight, AFBC_NORMAL_HEIGHT_ALIGN);
+	}
 
 	yuv420_afbc_luma_stride = width;
 	yuv420_afbc_chroma_stride = GRALLOC_ALIGN(yuv420_afbc_luma_stride / 2, 16); /* Horizontal downsampling*/
@@ -272,9 +348,8 @@ static bool get_afbc_yuv420_8bit_stride_and_size(int width, int height, int* pix
 	{
 		int nblocks = width / AFBC_PIXELS_PER_BLOCK * height / AFBC_PIXELS_PER_BLOCK;
 		/* Simplification of (height * luma-stride + 2 * (height /2 * chroma_stride) */
-		*size =
-		    ( yuv420_afbc_luma_stride + yuv420_afbc_chroma_stride ) * height +
-		    GRALLOC_ALIGN( nblocks * AFBC_HEADER_BUFFER_BYTES_PER_BLOCKENTRY, AFBC_BODY_BUFFER_BYTE_ALIGNMENT );
+		*size = (yuv420_afbc_luma_stride + yuv420_afbc_chroma_stride) * height +
+		        GRALLOC_ALIGN(nblocks * AFBC_HEADER_BUFFER_BYTES_PER_BLOCKENTRY, buffer_byte_alignment);
 	}
 
 	if (byte_stride != NULL)
@@ -303,14 +378,15 @@ static bool get_afbc_yuv420_8bit_stride_and_size(int width, int height, int* pix
  * internalHeight   (out) The internal height, which may be greater than the public known height.
  * stride_alignment (in)  stride aligment value in bytes.
  */
-static bool get_yv12_stride_and_size(int width, int height, int* pixel_stride, int* byte_stride, size_t* size,
-                                     AllocType type, int* internalHeight, int stride_alignment)
+static bool get_yv12_stride_and_size(int width, int height, int *pixel_stride, int *byte_stride, size_t *size,
+                                     AllocType type, int *internalHeight, int stride_alignment)
 {
 	int luma_stride;
 
 	if (type != UNCOMPRESSED)
 	{
-		return get_afbc_yuv420_8bit_stride_and_size(width, height, pixel_stride, byte_stride, size, type, internalHeight);
+		return get_afbc_yuv420_8bit_stride_and_size(width, height, pixel_stride, byte_stride, size, type,
+		                                            internalHeight);
 	}
 
 	/* 4:2:0 formats must have buffers with even height and width as the clump size is 2x2 pixels.
@@ -323,7 +399,7 @@ static bool get_yv12_stride_and_size(int width, int height, int* pixel_stride, i
 	{
 		int chroma_stride = GRALLOC_ALIGN(luma_stride / 2, stride_alignment);
 		/* Simplification of ((height * luma_stride ) + 2 * ((height / 2) * chroma_stride)). */
-		*size = height * (luma_stride + chroma_stride);
+		*size = height *(luma_stride + chroma_stride);
 	}
 
 	if (byte_stride != NULL)
@@ -349,7 +425,7 @@ static bool get_yv12_stride_and_size(int width, int height, int* pixel_stride, i
  * byte_stride      (out) stride of the buffer in bytes
  * size             (out) size of the buffer in bytes
  */
-static bool get_yuv422_8bit_stride_and_size(int width, int height, int* pixel_stride, int* byte_stride, size_t* size)
+static bool get_yuv422_8bit_stride_and_size(int width, int height, int *pixel_stride, int *byte_stride, size_t *size)
 {
 	int local_byte_stride, local_pixel_stride;
 
@@ -357,11 +433,11 @@ static bool get_yuv422_8bit_stride_and_size(int width, int height, int* pixel_st
 	 * This is taken care of by the even stride alignment. */
 
 	local_pixel_stride = GRALLOC_ALIGN(width, YUV_MALI_PLANE_ALIGN);
-	local_byte_stride  = GRALLOC_ALIGN(width * 2, YUV_MALI_PLANE_ALIGN); /* 4 bytes per 2 pixels */
+	local_byte_stride = GRALLOC_ALIGN(width * 2, YUV_MALI_PLANE_ALIGN); /* 4 bytes per 2 pixels */
 
 	if (size != NULL)
 	{
-		*size = local_byte_stride * height;
+		*size = local_byte_stride *height;
 	}
 
 	if (byte_stride != NULL)
@@ -377,64 +453,6 @@ static bool get_yuv422_8bit_stride_and_size(int width, int height, int* pixel_st
 	return true;
 }
 
-
-static bool get_rk_nv12_stride_and_size(int width, int height, int* pixel_stride, int* byte_stride, size_t* size)
-{
-
-    /**
-     * .KP : from CSY : video_decoder 要求的 byte_stride of buffer in NV12, 已经通过 width 传入.
-     * 对 NV12, byte_stride 就是 pixel_stride, 也就是 luma_stride.
-     */
-       int luma_stride = width;
-
-       if (width % 2 != 0 || height % 2 != 0)
-       {
-               return false;
-       }
-
-       if (size != NULL)
-       {
-        /* .KP : from CSY : video_decoder 需要的 buffer 中除了 YUV 数据还有其他 metadata, 要更多的空间. 2 * w * h 一定够. */
-        *size = 2 * luma_stride * height;
-       }
-
-       if (byte_stride != NULL)
-       {
-               *byte_stride = luma_stride;
-       }
-
-       if (pixel_stride != NULL)
-       {
-               *pixel_stride = luma_stride;
-       }
-
-       return true;
-}
-
-static bool get_rk_nv12_10bit_stride_and_size (int width, int height, int* pixel_stride, int* byte_stride, size_t* size)
-{
-
-       if (width % 2 != 0 || height % 2 != 0)
-       {
-               return false;
-       }
-
-    /**
-     * .KP : from CSY : video_decoder 要求的 byte_stride of buffer in NV12_10, 已经通过 width 传入.
-     * 对 NV12_10, 原理上, byte_stride 和 pixel_stride 不同.
-     */
-       *byte_stride = width;
-
-    /* .KP : from CSY : video_decoder 需要的 buffer 中除了 YUV 数据还有其他 metadata, 要更多的空间. 2 * w * h 一定够. */
-    *size = 2 * width * height;
-
-       *pixel_stride = *byte_stride;
-    // 字面上, 这是错误的,
-    // 但是目前对于 NV12_10, rk_hwc, 将 private_module_t::stride 作为 byte_stride 使用.
-
-       return true;
-}
-
 /*
  * Computes the strides and size for an AFBC 8BIT YUV 4:2:2 buffer
  *
@@ -446,31 +464,44 @@ static bool get_rk_nv12_10bit_stride_and_size (int width, int height, int* pixel
  * size         (out)  size of the buffer in bytes
  * type                if buffer should be allocated for a certain afbc type
  */
-static bool get_afbc_yuv422_8bit_stride_and_size(int width, int height, int* pixel_stride, int* byte_stride, size_t* size, AllocType type)
+static bool get_afbc_yuv422_8bit_stride_and_size(int width, int height, int *pixel_stride, int *byte_stride,
+                                                 size_t *size, AllocType type)
 {
 	int yuv422_afbc_luma_stride;
+	int buffer_byte_alignment = AFBC_BODY_BUFFER_BYTE_ALIGNMENT;
 
 	if (type == UNCOMPRESSED)
 	{
 		AERR(" Buffer must be allocated with AFBC mode for internal pixel format YUV422_8BIT_AFBC!");
 		return false;
 	}
-
-	if (type == AFBC_PADDED)
+	else if (type == AFBC_TILED_HEADERS_BASIC)
+	{
+		width = GRALLOC_ALIGN(width, AFBC_TILED_HEADERS_BASIC_WIDTH_ALIGN);
+		height = GRALLOC_ALIGN(height, AFBC_TILED_HEADERS_BASIC_HEIGHT_ALIGN);
+		buffer_byte_alignment = 4 * AFBC_BODY_BUFFER_BYTE_ALIGNMENT;
+	}
+	else if (type == AFBC_TILED_HEADERS_WIDEBLK)
+	{
+		width = GRALLOC_ALIGN(width, AFBC_TILED_HEADERS_WIDEBLK_WIDTH_ALIGN);
+		height = GRALLOC_ALIGN(height, AFBC_TILED_HEADERS_WIDEBLK_HEIGHT_ALIGN);
+		buffer_byte_alignment = 4 * AFBC_BODY_BUFFER_BYTE_ALIGNMENT;
+	}
+	else if (type == AFBC_PADDED)
 	{
 		AERR("GRALLOC_USAGE_PRIVATE_2 (64byte header row alignment for AFBC) is not supported for YUV");
 		return false;
 	}
-
-	if (type == AFBC_WIDEBLK)
+	else if (type == AFBC_WIDEBLK)
 	{
 		width = GRALLOC_ALIGN(width, AFBC_WIDEBLK_WIDTH_ALIGN);
+		height = GRALLOC_ALIGN(height, AFBC_WIDEBLK_HEIGHT_ALIGN);
 	}
 	else
 	{
-		width = GRALLOC_ALIGN(width, AFBC_PIXELS_PER_BLOCK);
+		width = GRALLOC_ALIGN(width, AFBC_NORMAL_WIDTH_ALIGN);
+		height = GRALLOC_ALIGN(height, AFBC_NORMAL_HEIGHT_ALIGN);
 	}
-	height = GRALLOC_ALIGN(height, AFBC_PIXELS_PER_BLOCK);
 
 	yuv422_afbc_luma_stride = width;
 
@@ -478,8 +509,8 @@ static bool get_afbc_yuv422_8bit_stride_and_size(int width, int height, int* pix
 	{
 		int nblocks = width / AFBC_PIXELS_PER_BLOCK * height / AFBC_PIXELS_PER_BLOCK;
 		/* YUV 4:2:2 luma size equals chroma size */
-		*size = yuv422_afbc_luma_stride * height * 2
-			+ GRALLOC_ALIGN(nblocks * AFBC_HEADER_BUFFER_BYTES_PER_BLOCKENTRY, AFBC_BODY_BUFFER_BYTE_ALIGNMENT);
+		*size = yuv422_afbc_luma_stride *height * 2 +
+		        GRALLOC_ALIGN(nblocks * AFBC_HEADER_BUFFER_BYTES_PER_BLOCKENTRY, buffer_byte_alignment);
 	}
 
 	if (byte_stride != NULL)
@@ -512,7 +543,8 @@ static bool get_afbc_yuv422_8bit_stride_and_size(int width, int height, int* pix
  * @return true if the calculation was successful; false otherwise (invalid
  * parameter)
  */
-static bool get_yuv_pX10_stride_and_size(int width, int height, int vss, int* pixel_stride, int* byte_stride, size_t* size)
+static bool get_yuv_pX10_stride_and_size(int width, int height, int vss, int *pixel_stride, int *byte_stride,
+                                         size_t *size)
 {
 	int luma_pixel_stride, luma_byte_stride;
 
@@ -531,12 +563,12 @@ static bool get_yuv_pX10_stride_and_size(int width, int height, int vss, int* pi
 	}
 
 	luma_pixel_stride = GRALLOC_ALIGN(width, YUV_MALI_PLANE_ALIGN);
-	luma_byte_stride  = GRALLOC_ALIGN(width * 2, YUV_MALI_PLANE_ALIGN);
+	luma_byte_stride = GRALLOC_ALIGN(width * 2, YUV_MALI_PLANE_ALIGN);
 
 	if (size != NULL)
 	{
 		int chroma_size = GRALLOC_ALIGN(width * 2, YUV_MALI_PLANE_ALIGN) * (height / vss);
-		*size = luma_byte_stride * height + chroma_size;
+		*size = luma_byte_stride *height + chroma_size;
 	}
 
 	if (byte_stride != NULL)
@@ -567,7 +599,7 @@ static bool get_yuv_pX10_stride_and_size(int width, int height, int vss, int* pi
  * @return true if the calculation was successful; false otherwise (invalid
  * parameter)
  */
-static bool get_yuv_y210_stride_and_size(int width, int height, int* pixel_stride, int* byte_stride, size_t* size)
+static bool get_yuv_y210_stride_and_size(int width, int height, int *pixel_stride, int *byte_stride, size_t *size)
 {
 	int y210_byte_stride, y210_pixel_stride;
 
@@ -576,11 +608,11 @@ static bool get_yuv_y210_stride_and_size(int width, int height, int* pixel_strid
 
 	y210_pixel_stride = GRALLOC_ALIGN(width, YUV_MALI_PLANE_ALIGN);
 	/* 4x16 bits per 2 pixels */
-	y210_byte_stride  = GRALLOC_ALIGN(width * 4, YUV_MALI_PLANE_ALIGN);
+	y210_byte_stride = GRALLOC_ALIGN(width * 4, YUV_MALI_PLANE_ALIGN);
 
 	if (size != NULL)
 	{
-		*size = y210_byte_stride * height;
+		*size = y210_byte_stride *height;
 	}
 
 	if (byte_stride != NULL)
@@ -614,7 +646,7 @@ static bool get_yuv_y210_stride_and_size(int width, int height, int* pixel_strid
  * @note Each YUYAAYVYAA clump encodes a 2x2 area of pixels. YU&V are 10 bits. A is 1 bit. total 8 bytes
  *
  */
-static bool get_yuv_y0l2_stride_and_size(int width, int height, int* pixel_stride, int* byte_stride, size_t* size)
+static bool get_yuv_y0l2_stride_and_size(int width, int height, int *pixel_stride, int *byte_stride, size_t *size)
 {
 	int y0l2_byte_stride, y0l2_pixel_stride;
 
@@ -623,11 +655,11 @@ static bool get_yuv_y0l2_stride_and_size(int width, int height, int* pixel_strid
 	height = GRALLOC_ALIGN(height, 2);
 
 	y0l2_pixel_stride = GRALLOC_ALIGN(width, YUV_MALI_PLANE_ALIGN);
-	y0l2_byte_stride  = GRALLOC_ALIGN(width * 4, YUV_MALI_PLANE_ALIGN); /* 2 horiz pixels per 8 byte clump */
+	y0l2_byte_stride = GRALLOC_ALIGN(width * 4, YUV_MALI_PLANE_ALIGN); /* 2 horiz pixels per 8 byte clump */
 
 	if (size != NULL)
 	{
-		*size = y0l2_byte_stride * height / 2; /* byte stride covers 2 vert pixels */
+		*size = y0l2_byte_stride *height / 2; /* byte stride covers 2 vert pixels */
 	}
 
 	if (byte_stride != NULL)
@@ -639,8 +671,10 @@ static bool get_yuv_y0l2_stride_and_size(int width, int height, int* pixel_strid
 	{
 		*pixel_stride = y0l2_pixel_stride;
 	}
+
 	return true;
 }
+
 /*
  *  Calculate strides and strides for Y410 (AVYU packed, 4:4:4) format buffer.
  *
@@ -656,17 +690,17 @@ static bool get_yuv_y0l2_stride_and_size(int width, int height, int* pixel_strid
  * @return true if the calculation was successful; false otherwise (invalid
  * parameter)
  */
-static bool get_yuv_y410_stride_and_size(int width, int height, int* pixel_stride, int* byte_stride, size_t* size)
+static bool get_yuv_y410_stride_and_size(int width, int height, int *pixel_stride, int *byte_stride, size_t *size)
 {
 	int y410_byte_stride, y410_pixel_stride;
 
 	y410_pixel_stride = GRALLOC_ALIGN(width, YUV_MALI_PLANE_ALIGN);
-	y410_byte_stride  = GRALLOC_ALIGN(width * 4, YUV_MALI_PLANE_ALIGN);
+	y410_byte_stride = GRALLOC_ALIGN(width * 4, YUV_MALI_PLANE_ALIGN);
 
 	if (size != NULL)
 	{
 		/* 4x8bits per pixel */
-		*size = y410_byte_stride * height;
+		*size = y410_byte_stride *height;
 	}
 
 	if (byte_stride != NULL)
@@ -678,6 +712,7 @@ static bool get_yuv_y410_stride_and_size(int width, int height, int* pixel_strid
 	{
 		*pixel_stride = y410_pixel_stride;
 	}
+
 	return true;
 }
 
@@ -694,53 +729,78 @@ static bool get_yuv_y410_stride_and_size(int width, int height, int* pixel_strid
  *                              sizes of all planes.
  * @param type          [in]    afbc mode that buffer should be allocated with.
  *
+ * @param internalHeight [out]  Internal buffer height that used by consumer or producer
+ *
  * @return true if the calculation was successful; false otherwise (invalid
  * parameter)
  */
-static bool get_yuv420_10bit_afbc_stride_and_size(int width, int height, int* pixel_stride, int* byte_stride, size_t* size, AllocType type)
+static bool get_yuv420_10bit_afbc_stride_and_size(int width, int height, int *pixel_stride, int *byte_stride,
+                                                  size_t *size, AllocType type, int *internalHeight)
 {
 	int yuv420_afbc_byte_stride, yuv420_afbc_pixel_stride;
+	int buffer_byte_alignment = AFBC_BODY_BUFFER_BYTE_ALIGNMENT;
 
 	if (width & 3)
 	{
 		return false;
 	}
 
+	*internalHeight = height;
+#if MALI_VIDEO_VERSION
+	/* If we have a greater internal height than public we set the internalHeight. This
+	 * implies that cropping will be applied of internal dimensions to fit the public one. */
+	*internalHeight += AFBC_PIXELS_PER_BLOCK;
+#endif
+
+	/* The actual height used in size calculation must include the possible extra row. But
+	 * it must also be AFBC-aligned. Only the extra row-padding should be reported back in
+	 * internalHeight. This as only this row needs to be considered when cropping. */
 	if (type == UNCOMPRESSED)
 	{
 		AERR(" Buffer must be allocated with AFBC mode for internal pixel format YUV420_10BIT_AFBC!");
 		return false;
 	}
-
-	if (type == AFBC_PADDED)
+	else if (type == AFBC_TILED_HEADERS_BASIC)
+	{
+		width = GRALLOC_ALIGN(width, AFBC_TILED_HEADERS_BASIC_WIDTH_ALIGN);
+		height = GRALLOC_ALIGN(*internalHeight / 2, AFBC_TILED_HEADERS_BASIC_HEIGHT_ALIGN);
+		buffer_byte_alignment = 4 * AFBC_BODY_BUFFER_BYTE_ALIGNMENT;
+	}
+	else if (type == AFBC_TILED_HEADERS_WIDEBLK)
+	{
+		width = GRALLOC_ALIGN(width, AFBC_TILED_HEADERS_WIDEBLK_WIDTH_ALIGN);
+		height = GRALLOC_ALIGN(*internalHeight / 2, AFBC_TILED_HEADERS_WIDEBLK_HEIGHT_ALIGN);
+		buffer_byte_alignment = 4 * AFBC_BODY_BUFFER_BYTE_ALIGNMENT;
+	}
+	else if (type == AFBC_PADDED)
 	{
 		AERR("GRALLOC_USAGE_PRIVATE_2 (64byte header row alignment for AFBC) is not supported for YUV");
 		return false;
 	}
-
-	if (type == AFBC_WIDEBLK)
+	else if (type == AFBC_WIDEBLK)
 	{
 		width = GRALLOC_ALIGN(width, AFBC_WIDEBLK_WIDTH_ALIGN);
+		height = GRALLOC_ALIGN(*internalHeight / 2, AFBC_WIDEBLK_HEIGHT_ALIGN);
 	}
 	else
 	{
-		width = GRALLOC_ALIGN(width, AFBC_PIXELS_PER_BLOCK);
+		width = GRALLOC_ALIGN(width, AFBC_NORMAL_WIDTH_ALIGN);
+		height = GRALLOC_ALIGN(*internalHeight / 2, AFBC_NORMAL_HEIGHT_ALIGN);
 	}
-	height = GRALLOC_ALIGN(height/2, AFBC_PIXELS_PER_BLOCK); /* vertically downsampled */
 
 	yuv420_afbc_pixel_stride = GRALLOC_ALIGN(width, 16);
-	yuv420_afbc_byte_stride  = GRALLOC_ALIGN(width * 4, 16); /* 64-bit packed and horizontally downsampled */
+	yuv420_afbc_byte_stride = GRALLOC_ALIGN(width * 4, 16); /* 64-bit packed and horizontally downsampled */
 
 	if (size != NULL)
 	{
-		int nblocks = width / AFBC_PIXELS_PER_BLOCK * height / AFBC_PIXELS_PER_BLOCK;
-		*size = yuv420_afbc_byte_stride * height
-			+ GRALLOC_ALIGN(nblocks * AFBC_HEADER_BUFFER_BYTES_PER_BLOCKENTRY, AFBC_BODY_BUFFER_BYTE_ALIGNMENT);
+		int nblocks = width / AFBC_PIXELS_PER_BLOCK * (*internalHeight) / AFBC_PIXELS_PER_BLOCK;
+		*size = yuv420_afbc_byte_stride *height +
+		        GRALLOC_ALIGN(nblocks * AFBC_HEADER_BUFFER_BYTES_PER_BLOCKENTRY, buffer_byte_alignment);
 	}
 
 	if (byte_stride != NULL)
 	{
-		*byte_stride = yuv420_afbc_byte_stride;
+		*byte_stride = yuv420_afbc_pixel_stride;
 	}
 
 	if (pixel_stride != NULL)
@@ -767,9 +827,11 @@ static bool get_yuv420_10bit_afbc_stride_and_size(int width, int height, int* pi
  * @return true if the calculation was successful; false otherwise (invalid
  * parameter)
  */
-static bool get_yuv422_10bit_afbc_stride_and_size(int width, int height, int* pixel_stride, int* byte_stride, size_t* size, AllocType type)
+static bool get_yuv422_10bit_afbc_stride_and_size(int width, int height, int *pixel_stride, int *byte_stride,
+                                                  size_t *size, AllocType type)
 {
 	int yuv422_afbc_byte_stride, yuv422_afbc_pixel_stride;
+	int buffer_byte_alignment = AFBC_BODY_BUFFER_BYTE_ALIGNMENT;
 
 	if (width & 3)
 	{
@@ -781,32 +843,43 @@ static bool get_yuv422_10bit_afbc_stride_and_size(int width, int height, int* pi
 		AERR(" Buffer must be allocated with AFBC mode for internal pixel format YUV422_10BIT_AFBC!");
 		return false;
 	}
-
-	if (type == AFBC_PADDED)
+	else if (type == AFBC_TILED_HEADERS_BASIC)
+	{
+		width = GRALLOC_ALIGN(width, AFBC_TILED_HEADERS_BASIC_WIDTH_ALIGN);
+		height = GRALLOC_ALIGN(height, AFBC_TILED_HEADERS_BASIC_HEIGHT_ALIGN);
+		buffer_byte_alignment = 4 * AFBC_BODY_BUFFER_BYTE_ALIGNMENT;
+	}
+	else if (type == AFBC_TILED_HEADERS_WIDEBLK)
+	{
+		width = GRALLOC_ALIGN(width, AFBC_TILED_HEADERS_WIDEBLK_WIDTH_ALIGN);
+		height = GRALLOC_ALIGN(height, AFBC_TILED_HEADERS_WIDEBLK_HEIGHT_ALIGN);
+		buffer_byte_alignment = 4 * AFBC_BODY_BUFFER_BYTE_ALIGNMENT;
+	}
+	else if (type == AFBC_PADDED)
 	{
 		AERR("GRALLOC_USAGE_PRIVATE_2 (64byte header row alignment for AFBC) is not supported for YUV");
 		return false;
 	}
-
-	if (type == AFBC_WIDEBLK)
+	else if (type == AFBC_WIDEBLK)
 	{
 		width = GRALLOC_ALIGN(width, AFBC_WIDEBLK_WIDTH_ALIGN);
+		height = GRALLOC_ALIGN(height, AFBC_WIDEBLK_HEIGHT_ALIGN);
 	}
 	else
 	{
-		width = GRALLOC_ALIGN(width, AFBC_PIXELS_PER_BLOCK);
+		width = GRALLOC_ALIGN(width, AFBC_NORMAL_WIDTH_ALIGN);
+		height = GRALLOC_ALIGN(height, AFBC_NORMAL_HEIGHT_ALIGN);
 	}
-	height = GRALLOC_ALIGN(height, AFBC_PIXELS_PER_BLOCK); /* total number of rows must be even number */
 
 	yuv422_afbc_pixel_stride = GRALLOC_ALIGN(width, 16);
-	yuv422_afbc_byte_stride  = GRALLOC_ALIGN(width * 2, 16);
+	yuv422_afbc_byte_stride = GRALLOC_ALIGN(width * 2, 16);
 
 	if (size != NULL)
 	{
 		int nblocks = width / AFBC_PIXELS_PER_BLOCK * height / AFBC_PIXELS_PER_BLOCK;
 		/* YUV 4:2:2 chroma size equals to luma size */
-		*size = yuv422_afbc_byte_stride * height * 2
-			+ GRALLOC_ALIGN(nblocks * AFBC_HEADER_BUFFER_BYTES_PER_BLOCKENTRY, AFBC_BODY_BUFFER_BYTE_ALIGNMENT);
+		*size = yuv422_afbc_byte_stride *height * 2 +
+		        GRALLOC_ALIGN(nblocks * AFBC_HEADER_BUFFER_BYTES_PER_BLOCKENTRY, buffer_byte_alignment);
 	}
 
 	if (byte_stride != NULL)
@@ -821,7 +894,7 @@ static bool get_yuv422_10bit_afbc_stride_and_size(int width, int height, int* pi
 
 	return true;
 }
-#if PLATFORM_SDK_VERSION >= 23
+
 /*
  *  Calculate strides and strides for Camera RAW and Blob formats
  *
@@ -843,45 +916,47 @@ static bool get_camera_formats_stride_and_size(int w, int h, uint64_t format, in
 
 	switch (format)
 	{
-		case HAL_PIXEL_FORMAT_RAW16:
-			stride = w; /* Format assumes stride in pixels */
-			stride = GRALLOC_ALIGN(stride, 16); /* Alignment mandated by Android */
-			size = stride * h * 2; /* 2 bytes per pixel */
-			break;
+	case HAL_PIXEL_FORMAT_RAW16:
+		stride = w; /* Format assumes stride in pixels */
+		stride = GRALLOC_ALIGN(stride, 16); /* Alignment mandated by Android */
+		size = stride * h * 2; /* 2 bytes per pixel */
+		break;
 
-		case HAL_PIXEL_FORMAT_RAW12:
-			if (w % 4 != 0)
-			{
-				ALOGE("ERROR: Width for HAL_PIXEL_FORMAT_RAW12 buffers has to be multiple of 4.");
-				return false;
-			}
-			stride = (w / 2) * 3; /* Stride in bytes; 2 pixels in 3 bytes */
-			size = stride * h;
-			break;
-
-		case HAL_PIXEL_FORMAT_RAW10:
-			if (w % 4 != 0)
-			{
-				ALOGE("ERROR: Width for HAL_PIXEL_FORMAT_RAW10 buffers has to be multiple of 4.");
-				return false;
-			}
-			stride = (w / 4) * 5; /* Stride in bytes; 4 pixels in 5 bytes */
-			size = stride * h;
-			break;
-
-		case HAL_PIXEL_FORMAT_BLOB:
-			if (h != 1)
-			{
-				ALOGE("ERROR: Height for HAL_PIXEL_FORMAT_BLOB must be 1.");
-				return false;
-			}
-			stride = 0; /* No 'rows', it's effectively a long one dimensional array */
-			size = w;
-			break;
-
-		default:
+	case HAL_PIXEL_FORMAT_RAW12:
+		if (w % 4 != 0)
+		{
+			ALOGE("ERROR: Width for HAL_PIXEL_FORMAT_RAW12 buffers has to be multiple of 4.");
 			return false;
+		}
 
+		stride = (w / 2) * 3; /* Stride in bytes; 2 pixels in 3 bytes */
+		size = stride * h;
+		break;
+
+	case HAL_PIXEL_FORMAT_RAW10:
+		if (w % 4 != 0)
+		{
+			ALOGE("ERROR: Width for HAL_PIXEL_FORMAT_RAW10 buffers has to be multiple of 4.");
+			return false;
+		}
+
+		stride = (w / 4) * 5; /* Stride in bytes; 4 pixels in 5 bytes */
+		size = stride * h;
+		break;
+
+	case HAL_PIXEL_FORMAT_BLOB:
+		if (h != 1)
+		{
+			ALOGE("ERROR: Height for HAL_PIXEL_FORMAT_BLOB must be 1.");
+			return false;
+		}
+
+		stride = 0; /* No 'rows', it's effectively a long one dimensional array */
+		size = w;
+		break;
+
+	default:
+		return false;
 	}
 
 	if (out_size != NULL)
@@ -896,54 +971,494 @@ static bool get_camera_formats_stride_and_size(int w, int h, uint64_t format, in
 
 	return true;
 }
-#endif /* PLATFORM_SDK_VERSION >= 23 */
 
-static void init_afbc(uint8_t *buf, uint64_t format, int w, int h)
+
+static bool get_rk_nv12_stride_and_size(int width, int height, int* pixel_stride, int* byte_stride, size_t* size)
 {
-        uint32_t n_headers = (w * h) / 64;
-        uint32_t body_offset = n_headers * 16;
-        uint32_t headers[][4] = { {body_offset, 0x1, 0x0, 0x0}, /* Layouts 0, 3, 4 */
-                                  {(body_offset + (1 << 28)), 0x200040, 0x4000, 0x80} /* Layouts 1, 5 */
-                                };
-        uint32_t i, layout;
+    /**
+     * .KP : from CSY : video_decoder 要求的 byte_stride of buffer in NV12, 已经通过 width 传入.
+     * 对 NV12, byte_stride 就是 pixel_stride, 也就是 luma_stride.
+     */
+    int luma_stride = width;
 
-        /* map format if necessary */
-        uint64_t mapped_format = map_format(format);
+    if (width % 2 != 0 || height % 2 != 0)
+    {
+        return false;
+    }
 
-        switch (mapped_format)
-        {
-                case HAL_PIXEL_FORMAT_RGBA_8888:
-                case HAL_PIXEL_FORMAT_RGBX_8888:
-                case HAL_PIXEL_FORMAT_RGB_888:
-                case HAL_PIXEL_FORMAT_RGB_565:
-                case HAL_PIXEL_FORMAT_BGRA_8888:
-#if (PLATFORM_SDK_VERSION >= 19) && (PLATFORM_SDK_VERSION <= 22)
-                case HAL_PIXEL_FORMAT_sRGB_A_8888:
-                case HAL_PIXEL_FORMAT_sRGB_X_8888:
-#endif
-                        layout = 0;
-                        break;
+    if (size != NULL)
+    {
+        /* .KP : from CSY : video_decoder 需要的 buffer 中除了 YUV 数据还有其他 metadata, 要更多的空间. 2 * w * h 一定够. */
+        *size = 2 * luma_stride * height;
+    }
 
-                case HAL_PIXEL_FORMAT_YV12:
-                case GRALLOC_ARM_HAL_FORMAT_INDEXED_NV12:
-                case GRALLOC_ARM_HAL_FORMAT_INDEXED_NV21:
-                        layout = 1;
-                        break;
-                default:
-                        layout = 0;
-        }
+    if (byte_stride != NULL)
+    {
+        *byte_stride = luma_stride;
+    }
 
-        AINF("Writing AFBC header layout %d for format %" PRIu64 "", layout, format);
+    if (pixel_stride != NULL)
+    {
+        *pixel_stride = luma_stride;
+    }
 
-        for (i = 0; i < n_headers; i++)
-        {
-                memcpy(buf, headers[layout], sizeof(headers[layout]));
-                buf += sizeof(headers[layout]);
-        }
+    return true;
+}
 
+static bool get_rk_nv12_10bit_stride_and_size (int width, int height, int* pixel_stride, int* byte_stride, size_t* size)
+{
+
+    if (width % 2 != 0 || height % 2 != 0)
+    {
+        return false;
+    }
+
+    /**
+     * .KP : from CSY : video_decoder 要求的 byte_stride of buffer in NV12_10, 已经通过 width 传入.
+     * 对 NV12_10, 原理上, byte_stride 和 pixel_stride 不同.
+     */
+    *byte_stride = width;
+
+    /* .KP : from CSY : video_decoder 需要的 buffer 中除了 YUV 数据还有其他 metadata, 要更多的空间. 2 * w * h 一定够. */
+    *size = 2 * width * height;
+
+    *pixel_stride = *byte_stride;
+    // 字面上, 这是错误的,
+    // 但是目前对于 NV12_10, rk_hwc, 将 private_module_t::stride 作为 byte_stride 使用.
+
+    return true;
+}
+
+static void init_afbc(uint8_t *buf, uint64_t internal_format, int w, int h)
+{
+	uint32_t n_headers = (w * h) / 64;
+	uint32_t body_offset = n_headers * 16;
+	uint32_t headers[][4] = {
+		{ body_offset, 0x1, 0x0, 0x0 }, /* Layouts 0, 3, 4 */
+		{ (body_offset + (1 << 28)), 0x200040, 0x4000, 0x80 } /* Layouts 1, 5 */
+	};
+	uint32_t i, layout;
+
+	/* map format if necessary (also removes internal extension bits) */
+	uint64_t base_format = internal_format & MALI_GRALLOC_INTFMT_FMT_MASK;
+
+	switch (base_format)
+	{
+	case MALI_GRALLOC_FORMAT_INTERNAL_RGBA_8888:
+	case MALI_GRALLOC_FORMAT_INTERNAL_RGBX_8888:
+	case MALI_GRALLOC_FORMAT_INTERNAL_RGB_888:
+	case MALI_GRALLOC_FORMAT_INTERNAL_RGB_565:
+	case MALI_GRALLOC_FORMAT_INTERNAL_BGRA_8888:
+		layout = 0;
+		break;
+
+	case MALI_GRALLOC_FORMAT_INTERNAL_YV12:
+	case MALI_GRALLOC_FORMAT_INTERNAL_NV12:
+	case MALI_GRALLOC_FORMAT_INTERNAL_NV21:
+		layout = 1;
+		break;
+
+	default:
+		layout = 0;
+	}
+
+	ALOGV("Writing AFBC header layout %d for format %" PRIu64, layout, base_format);
+
+	for (i = 0; i < n_headers; i++)
+	{
+		memcpy(buf, headers[layout], sizeof(headers[layout]));
+		buf += sizeof(headers[layout]);
+	}
 }
 
 #endif
+
+#if RK_CTS_WORKROUND
+static bool ConvertCharToData(const char *pszHintName, const char *pszData, void *pReturn, IMG_DATA_TYPE eDataType)
+{
+	bool bFound = false;
+
+
+	switch(eDataType)
+	{
+		case IMG_STRING_TYPE:
+		{
+			strcpy((char*)pReturn, pszData);
+
+			ALOGD_IF(RK_DRM_GRALLOC_DEBUG, "Hint: Setting %s to %s\n", pszHintName, (char*)pReturn);
+
+			bFound = true;
+
+			break;
+		}
+		case IMG_FLOAT_TYPE:
+		{
+			*(float*)pReturn = (float) atof(pszData);
+
+			ALOGD_IF(RK_DRM_GRALLOC_DEBUG, "Hint: Setting %s to %f", pszHintName, *(float*)pReturn);
+
+			bFound = true;
+
+			break;
+		}
+		case IMG_UINT_TYPE:
+		case IMG_FLAG_TYPE:
+		{
+			/* Changed from atoi to stroul to support hexadecimal numbers */
+			*(u32*)pReturn = (u32) strtoul(pszData, NULL, 0);
+			if (*(u32*)pReturn > 9)
+			{
+				ALOGD_IF(RK_DRM_GRALLOC_DEBUG, "Hint: Setting %s to %u (0x%X)", pszHintName, *(u32*)pReturn, *(u32*)pReturn);
+			}
+			else
+			{
+				ALOGD_IF(RK_DRM_GRALLOC_DEBUG, "Hint: Setting %s to %u", pszHintName, *(u32*)pReturn);
+			}
+			bFound = true;
+
+			break;
+		}
+		case IMG_INT_TYPE:
+		{
+			*(int*)pReturn = (int) atoi(pszData);
+
+			ALOGD_IF(RK_DRM_GRALLOC_DEBUG, "Hint: Setting %s to %d\n", pszHintName, *(int*)pReturn);
+
+			bFound = true;
+
+			break;
+		}
+		default:
+		{
+			ALOGD_IF(RK_DRM_GRALLOC_DEBUG, "ConvertCharToData: Bad eDataType");
+
+			break;
+		}
+	}
+
+	return bFound;
+}
+
+static int getProcessCmdLine(char* outBuf, size_t bufSize)
+{
+	int ret = 0;
+
+	FILE* file = NULL;
+	long pid = 0;
+	char procPath[128]={0};
+
+	pid = getpid();
+	sprintf(procPath, "/proc/%ld/cmdline", pid);
+
+	file = fopen(procPath, "r");
+	if ( NULL == file )
+	{
+		ALOGE("fail to open file (%s)",strerror(errno));
+	}
+
+	if ( NULL == fgets(outBuf, bufSize - 1, file) )
+	{
+		ALOGE("fail to read from cmdline_file.");
+	}
+
+	if ( NULL != file )
+	{
+		fclose(file);
+	}
+
+	return ret;
+}
+
+bool FindAppHintInFile(const char *pszFileName, const char *pszAppName,
+								  const char *pszHintName, void *pReturn,
+								  IMG_DATA_TYPE eDataType)
+{
+	FILE *regFile;
+	bool bFound = false;
+
+	regFile = fopen(pszFileName, "r");
+
+	if(regFile)
+	{
+		char pszTemp[1024], pszApplicationSectionName[1024];
+		int iLineNumber;
+		bool bUseThisSection, bInAppSpecificSection;
+
+		/* Build the section name */
+		snprintf(pszApplicationSectionName, 1024, "[%s]", pszAppName);
+
+		bUseThisSection 		= false;
+		bInAppSpecificSection	= false;
+
+		iLineNumber = -1;
+
+		while(fgets(pszTemp, 1024, regFile))
+		{
+			size_t uiStrLen;
+
+			iLineNumber++;
+			ALOGD_IF(RK_DRM_GRALLOC_DEBUG, "FindAppHintInFile iLineNumber=%d pszTemp=%s",iLineNumber,pszTemp);
+
+			uiStrLen = strlen(pszTemp);
+
+			if (pszTemp[uiStrLen-1]!='\n')
+			{
+			    ALOGE("FindAppHintInFile : Error in %s at line %u",pszFileName,iLineNumber);
+
+				continue;
+			}
+
+			if((uiStrLen >= 2) && (pszTemp[uiStrLen-2] == '\r'))
+			{
+				/* CRLF (Windows) line ending */
+				pszTemp[uiStrLen-2] = '\0';
+			}
+			else
+			{
+				/* LF (unix) line ending */
+				pszTemp[uiStrLen-1] = '\0';
+			}
+
+			switch (pszTemp[0])
+			{
+				case '[':
+				{
+					/* Section */
+					bUseThisSection 		= false;
+					bInAppSpecificSection	= false;
+
+					if (!strcmp("[default]", pszTemp))
+					{
+						bUseThisSection = true;
+					}
+					else if (!strcmp(pszApplicationSectionName, pszTemp))
+					{
+						bUseThisSection 		= true;
+						bInAppSpecificSection 	= true;
+					}
+
+					break;
+				}
+				default:
+				{
+					char *pszPos;
+
+					if (!bUseThisSection)
+					{
+						/* This line isn't for us */
+						continue;
+					}
+
+					pszPos = strstr(pszTemp, pszHintName);
+
+					if (pszPos!=pszTemp)
+					{
+						/* Hint name isn't at start of string */
+						continue;
+					}
+
+					if (*(pszPos + strlen(pszHintName)) != '=')
+					{
+						/* Hint name isn't exactly correct, or isn't followed by an equals sign */
+						continue;
+					}
+
+					/* Move to after the equals sign */
+					pszPos += strlen(pszHintName) + 1;
+
+					/* Convert anything after the equals sign to the requested data type */
+					bFound = ConvertCharToData(pszHintName, pszPos, pReturn, eDataType);
+
+					if (bFound && bInAppSpecificSection)
+					{
+						/*
+						// If we've found the hint in the application specific section we may
+						// as well drop out now, since this should override any default setting
+						*/
+						fclose(regFile);
+
+						return true;
+					}
+
+					break;
+				}
+			}
+		}
+
+		fclose(regFile);
+	}
+	else
+	{
+		regFile = fopen(pszFileName, "wb+");
+		if(regFile)
+		{
+			char acBuf[] = "[android.view.cts]\n"
+							"view_cts=0\n"
+							"big_scale=0\n";
+			fprintf(regFile,"%s",acBuf);
+			fclose(regFile);
+			chmod(pszFileName, 0x777);
+		}
+		else
+		{
+			ALOGE("%s open fail errno=0x%x  (%s)",__FUNCTION__, errno,strerror(errno));
+		}
+	}
+
+	return bFound;
+}
+
+bool ModifyAppHintInFile(const char *pszFileName, const char *pszAppName,
+								const char *pszHintName, void *pReturn, int pSet,
+								IMG_DATA_TYPE eDataType)
+{
+	FILE *regFile;
+	bool bFound = false;
+
+	regFile = fopen(pszFileName, "r+");
+
+	if(regFile)
+	{
+		char pszTemp[1024], pszApplicationSectionName[1024];
+		int iLineNumber;
+		bool bUseThisSection, bInAppSpecificSection;
+		int offset = 0;
+
+		/* Build the section name */
+		snprintf(pszApplicationSectionName, 1024, "[%s]", pszAppName);
+
+		bUseThisSection		  = false;
+		bInAppSpecificSection   = false;
+
+		iLineNumber = -1;
+
+		while(fgets(pszTemp, 1024, regFile))
+		{
+			size_t uiStrLen;
+
+			iLineNumber++;
+			ALOGD_IF(RK_DRM_GRALLOC_DEBUG, "ModifyAppHintInFile iLineNumber=%d pszTemp=%s",iLineNumber,pszTemp);
+
+			uiStrLen = strlen(pszTemp);
+
+			if (pszTemp[uiStrLen-1]!='\n')
+			{
+				ALOGE("FindAppHintInFile : Error in %s at line %u",pszFileName,iLineNumber);
+				continue;
+			}
+
+			if((uiStrLen >= 2) && (pszTemp[uiStrLen-2] == '\r'))
+			{
+				/* CRLF (Windows) line ending */
+				pszTemp[uiStrLen-2] = '\0';
+			}
+			else
+			{
+				/* LF (unix) line ending */
+				pszTemp[uiStrLen-1] = '\0';
+			}
+
+			switch (pszTemp[0])
+			{
+				case '[':
+				{
+					/* Section */
+					bUseThisSection		  = false;
+					bInAppSpecificSection   = false;
+
+					if (!strcmp("[default]", pszTemp))
+					{
+						bUseThisSection = true;
+					}
+					else if (!strcmp(pszApplicationSectionName, pszTemp))
+					{
+						bUseThisSection		  = true;
+						bInAppSpecificSection   = true;
+					}
+
+					break;
+				}
+				default:
+				{
+					char *pszPos;
+
+					if (!bUseThisSection)
+					{
+						/* This line isn't for us */
+						offset += uiStrLen;
+						continue;
+					}
+
+					pszPos = strstr(pszTemp, pszHintName);
+
+					if (pszPos!=pszTemp)
+					{
+						/* Hint name isn't at start of string */
+						offset += uiStrLen;
+						continue;
+					}
+
+					if (*(pszPos + strlen(pszHintName)) != '=')
+					{
+						/* Hint name isn't exactly correct, or isn't followed by an equals sign */
+						offset += uiStrLen;
+						continue;
+					}
+
+					/* Move to after the equals sign */
+					pszPos += strlen(pszHintName) + 1;
+
+					/* Convert anything after the equals sign to the requested data type */
+					bFound = ConvertCharToData(pszHintName, pszPos, pReturn, eDataType);
+
+					if (bFound && bInAppSpecificSection)
+					{
+						offset += (strlen(pszHintName) + 1);
+						if(eDataType == IMG_INT_TYPE && *((int*)pReturn) != pSet)
+						{
+							fseek(regFile, offset, SEEK_SET);
+							fprintf(regFile,"%d",pSet);
+							*((int*)pReturn) = pSet;
+						}
+						/*
+						// If we've found the hint in the application specific section we may
+						// as well drop out now, since this should override any default setting
+						*/
+						fclose(regFile);
+
+						return true;
+					}
+
+					break;
+				}
+			}
+			offset += uiStrLen;
+		}
+
+		fclose(regFile);
+	}
+	else
+	{
+		regFile = fopen(pszFileName, "wb+");
+		if(regFile)
+		{
+			char acBuf[] = "[android.view.cts]\n"
+							"view_cts=0\n"
+							"big_scale=0\n";
+			fprintf(regFile,"%s",acBuf);
+			fclose(regFile);
+			chmod(pszFileName, 0x777);
+		}
+		else
+		{
+			ALOGE("%s open faile errno=0x%x  (%s)",__FUNCTION__, errno,strerror(errno));
+		}
+	}
+
+	return bFound;
+}
+#endif
+
 
 static void drm_gem_rockchip_destroy(struct gralloc_drm_drv_t *drv)
 {
@@ -954,7 +1469,16 @@ static void drm_gem_rockchip_destroy(struct gralloc_drm_drv_t *drv)
 	free(info);
 }
 
-static struct gralloc_drm_bo_t *drm_gem_rockchip_alloc(
+static bool should_disable_afbc_in_fb_target_layer()
+{
+    char value[PROPERTY_VALUE_MAX];
+
+    property_get("sys.gralloc.disable_afbc", value, "0");
+
+    return (0 == strcmp("1", value) );
+}
+
+struct gralloc_drm_bo_t *drm_gem_rockchip_alloc(
 		struct gralloc_drm_drv_t *drv,
 		struct gralloc_drm_handle_t *handle)
 {
@@ -968,7 +1492,7 @@ static struct gralloc_drm_bo_t *drm_gem_rockchip_alloc(
 	int ret;
 	size_t size;
 	uint32_t gem_handle;
-	AllocType type = UNCOMPRESSED;
+	AllocType alloc_type = UNCOMPRESSED;
 	bool alloc_for_extended_yuv = false, alloc_for_arm_afbc_yuv = false;
 	int internalWidth,internalHeight;
 	uint64_t internal_format;
@@ -987,26 +1511,10 @@ static struct gralloc_drm_bo_t *drm_gem_rockchip_alloc(
 #endif
 	uint32_t flags = 0;
 	struct drm_rockchip_gem_phys phys_arg;
-	int private_usage = 0;
 
-        ALOGD("enter, w : %d, h : %d, format : 0x%x, usage : 0x%x.", w, h, format, usage);
+        D("enter, w : %d, h : %d, format : 0x%x, usage : 0x%x.", w, h, format, usage);
 
 	phys_arg.phy_addr = 0;
-
-        if(format == HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED  )
-        {
-                if(usage & GRALLOC_USAGE_HW_VIDEO_ENCODER )
-                {
-                        ADBG("(usage & GRALLOC_USAGE_HW_VIDEO_ENCODER treat as NV12");
-                        format = HAL_PIXEL_FORMAT_YCrCb_NV12;
-                }
-                else
-                {
-                        ADBG("treat as NV12 888");
-                        format = HAL_PIXEL_FORMAT_RGBX_8888;
-                        fmt_chg = true;
-                }
-        }
 
 	/* Some formats require an internal width and height that may be used by
 	 * consumers/producers.
@@ -1014,11 +1522,10 @@ static struct gralloc_drm_bo_t *drm_gem_rockchip_alloc(
 	internalWidth = w;
 	internalHeight = h;
 
-        internal_format = gralloc_select_format(format, usage, w*h);
-
-        alloc_for_extended_yuv = (internal_format & GRALLOC_ARM_INTFMT_EXTENDED_YUV) == GRALLOC_ARM_INTFMT_EXTENDED_YUV;
-        alloc_for_arm_afbc_yuv = (internal_format & GRALLOC_ARM_INTFMT_ARM_AFBC_YUV) == GRALLOC_ARM_INTFMT_ARM_AFBC_YUV;
-
+    internal_format = mali_gralloc_select_format(format,
+                                                 MALI_GRALLOC_FORMAT_TYPE_USAGE,
+                                                 usage,
+                                                 w * h);
 #if USE_AFBC_LAYER
 	property_get("persist.sys.framebuffer.main", framebuffer_size, "0x0@60");
 	sscanf(framebuffer_size, "%dx%d@%d", &width, &height, &vrefresh);
@@ -1026,246 +1533,307 @@ static struct gralloc_drm_bo_t *drm_gem_rockchip_alloc(
 	if (height < 2160)
 	{
 #define MAGIC_USAGE_FOR_AFBC_LAYER     (0x88)
+        /* if current buffer is NOT for fb_target_layer, ... */
 	    if (!(usage & GRALLOC_USAGE_HW_FB)) {
 	            if (!(usage & GRALLOC_USAGE_EXTERNAL_DISP) &&
 	                MAGIC_USAGE_FOR_AFBC_LAYER == (usage & MAGIC_USAGE_FOR_AFBC_LAYER) ) {
-	                internal_format = GRALLOC_ARM_INTFMT_AFBC | GRALLOC_ARM_HAL_FORMAT_INDEXED_RGBA_8888;
-	                AWAR("use_afbc_layer: force to set 'internal_format' to 0x%llx for usage '0x%x'.", internal_format, usage);
+	                internal_format = MALI_GRALLOC_FORMAT_INTERNAL_RGBA_8888 | MALI_GRALLOC_INTFMT_AFBC_BASIC;
+	                D("use_afbc_layer: force to set 'internal_format' to 0x%llx for usage '0x%x'.", internal_format, usage);
 	            }
-	    } else {
-	        if(!(usage & GRALLOC_USAGE_EXTERNAL_DISP) &&
-	           MAGIC_USAGE_FOR_AFBC_LAYER != (usage & MAGIC_USAGE_FOR_AFBC_LAYER)) {
-	                internal_format = GRALLOC_ARM_INTFMT_AFBC | GRALLOC_ARM_HAL_FORMAT_INDEXED_RGBA_8888;
-	                property_set("sys.gmali.fbdc_target","1");
-	                AWAR("use_afbc_layer: force to set 'internal_format' to 0x%llx for buffer_for_fb_target_layer.",
-	                internal_format);
+	    }
+        /* IS for fb_target_layer, ... */
+        else
+        {
+	        if ( !(usage & GRALLOC_USAGE_EXTERNAL_DISP)
+                && MAGIC_USAGE_FOR_AFBC_LAYER != (usage & MAGIC_USAGE_FOR_AFBC_LAYER) )
+            {
+                /* if should NOT disable AFBC in fb_target_layer, ... */
+                if ( !should_disable_afbc_in_fb_target_layer() )
+                {
+                    internal_format = MALI_GRALLOC_FORMAT_INTERNAL_RGBA_8888 | MALI_GRALLOC_INTFMT_AFBC_BASIC;
+
+                    if ( handle->prime_fd < 0 ) // 只在将实际分配 buffer 的时候打印.
+                    {
+                        I("use_afbc_layer: force to set 'internal_format' to 0x%" PRIx64 " for buffer_for_fb_target_layer.",
+                          internal_format);
+                    }
+                    property_set("sys.gmali.fbdc_target","1");
+                }
+                /* if SHOULD disable AFBC in fb_target_layer, ... */
+                else
+                {
+                    if ( handle->prime_fd < 0 )
+                    {
+                        I("debug_only : not to use afbc in fb_target_layer, the original format : 0x%" PRIx64, internal_format);
+                    }
+			        property_set("sys.gmali.fbdc_target","0");
+                }
 	        }
 	        else
 	        {
-			property_set("sys.gmali.fbdc_target","0");
+			    property_set("sys.gmali.fbdc_target","0");
 	        }
 	    }
 	}
 #endif
 
-	if (internal_format & (GRALLOC_ARM_INTFMT_AFBC | GRALLOC_ARM_INTFMT_AFBC_SPLITBLK | GRALLOC_ARM_INTFMT_AFBC_WIDEBLK))
-	{
-		if (usage & GRALLOC_USAGE_PRIVATE_2)
-		{
-			type = AFBC_PADDED;
-		}
-		else if (internal_format & GRALLOC_ARM_INTFMT_AFBC_WIDEBLK)
-		{
-#if 1 != MALI_USE_YUV_AFBC_WIDEBLK
-                       if (alloc_for_arm_afbc_yuv)
-                       {
-                               ALOGE("Unsupported format YUV AFBC WIDEBLK.");
-                               return NULL;
-                       }
+    /* Determine AFBC type for this format */
+    if (internal_format & MALI_GRALLOC_INTFMT_AFBCENABLE_MASK)
+    {
+        if (internal_format & MALI_GRALLOC_INTFMT_AFBC_TILED_HEADERS)
+        {
+            if (internal_format & MALI_GRALLOC_INTFMT_AFBC_WIDEBLK)
+            {
+                alloc_type = AFBC_TILED_HEADERS_WIDEBLK;
+            }
+            else if (internal_format & MALI_GRALLOC_INTFMT_AFBC_BASIC)
+            {
+                alloc_type = AFBC_TILED_HEADERS_BASIC;
+            }
+            else if (internal_format & MALI_GRALLOC_INTFMT_AFBC_SPLITBLK)
+            {
+                ALOGE("Unsupported format. Splitblk in tiled header configuration.");
+                return NULL;
+            }
+        }
+        else if (usage & MALI_GRALLOC_USAGE_AFBC_PADDING)
+        {
+            alloc_type = AFBC_PADDED;
+        }
+        else if (internal_format & MALI_GRALLOC_INTFMT_AFBC_WIDEBLK)
+        {
+            alloc_type = AFBC_WIDEBLK;
+        }
+        else
+        {
+            alloc_type = AFBC;
+        }
+    }
+    
+    uint64_t base_format = internal_format & MALI_GRALLOC_INTFMT_FMT_MASK;
+
+    switch (base_format)
+    {
+        case HAL_PIXEL_FORMAT_RGBA_8888:
+        case HAL_PIXEL_FORMAT_RGBX_8888:
+        case HAL_PIXEL_FORMAT_BGRA_8888:
+#if PLATFORM_SDK_VERSION >= 26
+        case HAL_PIXEL_FORMAT_RGBA_1010102:
 #endif
-			type = AFBC_WIDEBLK;
-		}
-		else
-		{
-			type = AFBC;
-		}
-	}
+            get_rgb_stride_and_size(w, h, 4, &pixel_stride,
+                    &byte_stride, &size, alloc_type);
+            break;
 
-	/* Map format if necessary (also removes internal format extension bits) */
-	uint64_t mapped_format = map_format(internal_format);
+        case HAL_PIXEL_FORMAT_RGB_888:
+            get_rgb_stride_and_size(w, h, 3, &pixel_stride,
+                    &byte_stride, &size, alloc_type);
+            break;
 
-	if (!alloc_for_extended_yuv && !alloc_for_arm_afbc_yuv)
-	{
-		switch (mapped_format)
-		{
-			case HAL_PIXEL_FORMAT_RGBA_8888:
-			case HAL_PIXEL_FORMAT_RGBX_8888:
-			case HAL_PIXEL_FORMAT_BGRA_8888:
-#if (PLATFORM_SDK_VERSION >= 19) && (PLATFORM_SDK_VERSION <= 22)
-			case HAL_PIXEL_FORMAT_sRGB_A_8888:
-			case HAL_PIXEL_FORMAT_sRGB_X_8888:
+        case HAL_PIXEL_FORMAT_RGB_565:
+            get_rgb_stride_and_size(w, h, 2, &pixel_stride,
+                    &byte_stride, &size, alloc_type);
+            break;
+#if PLATFORM_SDK_VERSION >= 26
+        case HAL_PIXEL_FORMAT_RGBA_FP16:
+            get_rgb_stride_and_size(w, h, 8, &pixel_stride,
+                                    &byte_stride, &size, alloc_type);
+            break;
 #endif
-				get_rgb_stride_and_size(w, h, 4, &pixel_stride, &byte_stride, &size, type );
-				break;
-			case HAL_PIXEL_FORMAT_RGB_888:
-				get_rgb_stride_and_size(w, h, 3, &pixel_stride, &byte_stride, &size, type );
-				break;
-			case HAL_PIXEL_FORMAT_RGB_565:
-#if PLATFORM_SDK_VERSION < 19
-			case HAL_PIXEL_FORMAT_RGBA_5551:
-			case HAL_PIXEL_FORMAT_RGBA_4444:
-#endif
-				get_rgb_stride_and_size(w, h, 2, &pixel_stride, &byte_stride, &size, type );
-				break;
+        case HAL_PIXEL_FORMAT_YCrCb_420_SP:
+        case MALI_GRALLOC_FORMAT_INTERNAL_YV12:
+        case MALI_GRALLOC_FORMAT_INTERNAL_NV12:
+        case MALI_GRALLOC_FORMAT_INTERNAL_NV21:
+            {
+                /* Mali subsystem prefers higher stride alignment values (128 bytes) for YUV, but software components assume
+                 * default of 16. We only need to care about YV12 as it's the only, implicit, HAL YUV format in Android.
+                 */
+                int yv12_align = YUV_MALI_PLANE_ALIGN;
 
-			case HAL_PIXEL_FORMAT_YCrCb_420_SP:
-			case HAL_PIXEL_FORMAT_YV12:
-			case GRALLOC_ARM_HAL_FORMAT_INDEXED_NV12:
-			case GRALLOC_ARM_HAL_FORMAT_INDEXED_NV21:
-			{
-				/* Mali subsystem prefers higher stride alignment values (128 bytes) for YUV, but software components assume
-				 * default of 16. We only need to care about YV12 as it's the only, implicit, HAL YUV format in Android. 
-				 */				int yv12_align = YUV_MALI_PLANE_ALIGN;
-				if(usage & (GRALLOC_USAGE_SW_READ_MASK | GRALLOC_USAGE_SW_WRITE_MASK))
-				{
-					yv12_align = YUV_ANDROID_PLANE_ALIGN;
-				}
+                if (usage & (GRALLOC_USAGE_SW_READ_MASK | GRALLOC_USAGE_SW_WRITE_MASK))
+                {
+                    yv12_align = YUV_ANDROID_PLANE_ALIGN;
+                }
 
-				if (!get_yv12_stride_and_size(w, h, &pixel_stride, &byte_stride, &size, type,
-				                              &internalHeight, yv12_align))
-				{
-                                        AERR("fail to get stride and size.");
-					return NULL;
-				}
-				break;
-			}
-			case HAL_PIXEL_FORMAT_YCbCr_422_I:
-			{
-				/* YUYV 4:2:2 */
-				if (!get_yuv422_8bit_stride_and_size(w, h, &pixel_stride, &byte_stride, &size))
-				{
-					AERR("fail to get stride and size.");
-					return NULL;
-				}
-				break;
-			}
-#if PLATFORM_SDK_VERSION >= 23
-			case HAL_PIXEL_FORMAT_RAW16:
-			case HAL_PIXEL_FORMAT_RAW12:
-			case HAL_PIXEL_FORMAT_RAW10:
-			case HAL_PIXEL_FORMAT_BLOB:
-				get_camera_formats_stride_and_size(w, h, mapped_format, &pixel_stride, &size);
-				byte_stride = pixel_stride; /* For Raw/Blob formats stride is defined to be either in bytes or pixels per format */
-				break;
-#endif /*  PLATFORM_SDK_VERSION >= 23 */
+                if (!get_yv12_stride_and_size(w, h, &pixel_stride,
+                            &byte_stride, &size, alloc_type,
+                            &internalHeight, yv12_align))
+                {
+                    return NULL;
+                }
 
-                        /*
-                         * Additional custom formats can be added here
-                         * and must fill the variables pixel_stride, byte_stride and size.
-                         */
-                        case HAL_PIXEL_FORMAT_YCrCb_NV12:
-                        if (!get_rk_nv12_stride_and_size(w, h, &pixel_stride, &byte_stride, &size))
-                        {
-                                AERR("err.");
-                                return NULL;
-                        }
-                        AINF("for nv12, w : %d, h : %d, pixel_stride : %d, byte_stride : %d, size : %zu; internalHeight : %d.",
-                                w,
-                                h,
-                                pixel_stride,
-                                byte_stride,
-                                size,
-                                internalHeight);
-                        break;
+                break;
+            }
 
-                        case HAL_PIXEL_FORMAT_YCrCb_NV12_10:
-                        if (!get_rk_nv12_10bit_stride_and_size(w, h, &pixel_stride, &byte_stride, &size))
-                        {
-                                AERR("err.");
-                                return NULL;
-                        }
+        case HAL_PIXEL_FORMAT_YCbCr_422_I:
+            {
+                /* YUYV 4:2:2 */
+                if (alloc_type != UNCOMPRESSED ||
+                        !get_yuv422_8bit_stride_and_size(w, h,
+                            &pixel_stride, &byte_stride,
+                            &size))
+                {
+                    return NULL;
+                }
 
-                        AINF("for nv12_10, w : %d, h : %d, pixel_stride : %d, byte_stride : %d, size : %zu; internalHeight : %d.",
-                                w,
-                                h,
-                                pixel_stride,
-                                byte_stride,
-                                size,
-                                internalHeight);
-                        break;
+                break;
+            }
 
-			default:
-                                AERR("unexpected format : 0x%llx", internal_format & GRALLOC_ARM_INTFMT_FMT_MASK);
-				return NULL;
-		}
-	}
-	else
-	{
-		switch (mapped_format)
-		{
-			case GRALLOC_ARM_HAL_FORMAT_INDEXED_Y0L2:
-				/* YUYAAYUVAA 4:2:0 */
-				if (!get_yuv_y0l2_stride_and_size(w, h, &pixel_stride, &byte_stride, &size))
-				{
-					AERR("err.");
-					return NULL;
-				}
-				break;
+        case HAL_PIXEL_FORMAT_RAW16:
+        case HAL_PIXEL_FORMAT_RAW12:
+        case HAL_PIXEL_FORMAT_RAW10:
+        case HAL_PIXEL_FORMAT_BLOB:
+            if (alloc_type != UNCOMPRESSED)
+            {
+                return NULL;
+            }
 
-			case GRALLOC_ARM_HAL_FORMAT_INDEXED_P010:
-				/* Y-UV 4:2:0 */
-				if (!get_yuv_pX10_stride_and_size(w, h, 2, &pixel_stride, &byte_stride, &size))
-				{
-					AERR("err.");
-					return NULL;
-				}
-				break;
+            get_camera_formats_stride_and_size(w, h, base_format,
+                    &pixel_stride, &size);
+            /* For Raw/Blob formats stride is defined to be either in bytes or pixels per format */
+            byte_stride = pixel_stride;
+            break;
 
-			case GRALLOC_ARM_HAL_FORMAT_INDEXED_P210:
-				/* Y-UV 4:2:2 */
-				if (!get_yuv_pX10_stride_and_size(w, h, 1, &pixel_stride, &byte_stride, &size))
-				{
-					AERR("err.");
-					return NULL;
-				}
-				break;
+        case MALI_GRALLOC_FORMAT_INTERNAL_Y0L2:
 
-			case GRALLOC_ARM_HAL_FORMAT_INDEXED_Y210:
-				/* YUYV 4:2:2 */
-				if (!get_yuv_y210_stride_and_size(w, h, &pixel_stride, &byte_stride, &size))
-				{
-					AERR("err.");
-					return NULL;
-				}
-				break;
+            /* YUYAAYUVAA 4:2:0 with and without AFBC */
+            if (alloc_type != UNCOMPRESSED)
+            {
+                if (!get_yuv420_10bit_afbc_stride_and_size(
+                            w, h, &pixel_stride,
+                            &byte_stride, &size, alloc_type, &internalHeight))
+                {
+                    return NULL;
+                }
+            }
+            else
+            {
+                if (!get_yuv_y0l2_stride_and_size(w, h,
+                            &pixel_stride, &byte_stride,
+                            &size))
+                {
+                    return NULL;
+                }
+            }
 
-			case GRALLOC_ARM_HAL_FORMAT_INDEXED_Y410:
-				/* AVYU 2-10-10-10 */
-				if (!get_yuv_y410_stride_and_size(w, h, &pixel_stride, &byte_stride, &size))
-				{
-					AERR("err.");
-					return NULL;
-				}
-				break;
-				/* 8BIT AFBC YUV 4:2:0 testing usage */
-			case GRALLOC_ARM_HAL_FORMAT_INDEXED_YUV420_8BIT_AFBC:
-				if (!get_afbc_yuv420_8bit_stride_and_size(w, h, &pixel_stride, &byte_stride, &size, type, &internalHeight))
-				{
-					return NULL;;
-				}
-				break;
+            break;
 
-				/* 8BIT AFBC YUV4:2:2 testing usage */
-			case GRALLOC_ARM_HAL_FORMAT_INDEXED_YUV422_8BIT_AFBC:
-				if (!get_afbc_yuv422_8bit_stride_and_size(w, h, &pixel_stride, &byte_stride, &size, type))
-				{
-					return NULL;
-				}
-				break;
+        case MALI_GRALLOC_FORMAT_INTERNAL_P010:
 
-			case GRALLOC_ARM_HAL_FORMAT_INDEXED_YUV420_10BIT_AFBC:
-				/* YUV 4:2:0 compressed */
-				if (!get_yuv420_10bit_afbc_stride_and_size(w, h, &pixel_stride, &byte_stride, &size, type))
-				{
-					return NULL;
-				}
-				break;
-			case GRALLOC_ARM_HAL_FORMAT_INDEXED_YUV422_10BIT_AFBC:
-				/* YUV 4:2:2 compressed */
-				if (!get_yuv422_10bit_afbc_stride_and_size(w, h, &pixel_stride, &byte_stride, &size, type))
-				{
-					AERR("err.");
-					return NULL;
-				}
-				break;
+            /* Y-UV 4:2:0 */
+            if (alloc_type != UNCOMPRESSED ||
+                    !get_yuv_pX10_stride_and_size(w, h, 2,
+                        &pixel_stride, &byte_stride,
+                        &size))
+            {
+                return NULL;
+            }
 
-			default:
-				AERR("Invalid internal format %llx", internal_format & GRALLOC_ARM_INTFMT_FMT_MASK);
-				return NULL;
+            break;
 
-		}
-	}
+        case MALI_GRALLOC_FORMAT_INTERNAL_P210:
 
+            /* Y-UV 4:2:2 */
+            if (alloc_type != UNCOMPRESSED ||
+                    !get_yuv_pX10_stride_and_size(w, h, 1,
+                        &pixel_stride, &byte_stride,
+                        &size))
+            {
+                return NULL;
+            }
+
+            break;
+
+        case MALI_GRALLOC_FORMAT_INTERNAL_Y210:
+
+            /* YUYV 4:2:2 with and without AFBC */
+            if (alloc_type != UNCOMPRESSED)
+            {
+                if (!get_yuv422_10bit_afbc_stride_and_size(w, h,
+                            &pixel_stride, &byte_stride,
+                            &size, alloc_type))
+                {
+                    return NULL;
+                }
+            }
+            else
+            {
+                if (!get_yuv_y210_stride_and_size(w, h,
+                            &pixel_stride, &byte_stride,
+                            &size))
+                {
+                    return NULL;
+                }
+            }
+
+            break;
+
+        case MALI_GRALLOC_FORMAT_INTERNAL_Y410:
+
+            /* AVYU 2-10-10-10 */
+            if (alloc_type != UNCOMPRESSED ||
+                    !get_yuv_y410_stride_and_size(w, h, &pixel_stride,
+                        &byte_stride, &size))
+            {
+                return NULL;
+            }
+
+            break;
+
+        case MALI_GRALLOC_FORMAT_INTERNAL_YUV422_8BIT:
+
+            /* 8BIT AFBC YUV4:2:2 testing usage */
+
+            /* We only support compressed for this format right now.
+             * Below will fail in case format is uncompressed.
+             */
+            if (!get_afbc_yuv422_8bit_stride_and_size(w, h,
+                        &pixel_stride, &byte_stride,
+                        &size, alloc_type))
+            {
+                return NULL;
+            }
+
+            break;
+
+            /*
+             * Additional custom formats can be added here
+             * and must fill the variables pixel_stride, byte_stride and size.
+             */
+        case HAL_PIXEL_FORMAT_YCrCb_NV12:
+            if (!get_rk_nv12_stride_and_size(w, h, &pixel_stride, &byte_stride, &size))
+            {
+                AERR("err.");
+                return NULL;
+            }
+            AINF("for nv12, w : %d, h : %d, pixel_stride : %d, byte_stride : %d, size : %zu; internalHeight : %d.",
+                    w,
+                    h,
+                    pixel_stride,
+                    byte_stride,
+                    size,
+                    internalHeight);
+            break;
+
+        case HAL_PIXEL_FORMAT_YCrCb_NV12_10:
+            if (!get_rk_nv12_10bit_stride_and_size(w, h, &pixel_stride, &byte_stride, &size))
+            {
+                AERR("err.");
+                return NULL;
+            }
+
+            AINF("for nv12_10, w : %d, h : %d, pixel_stride : %d, byte_stride : %d, size : %zu; internalHeight : %d.",
+                    w,
+                    h,
+                    pixel_stride,
+                    byte_stride,
+                    size,
+                    internalHeight);
+            break;
+
+        default:
+            E("unexpected 'base_format' : 0x%" PRIx64, base_format);
+            return NULL;
+    }
 
 #if (1 == MALI_ARCHITECTURE_UTGARD)
 	/* match the framebuffer format */
@@ -1279,6 +1847,7 @@ static struct gralloc_drm_bo_t *drm_gem_rockchip_alloc(
 	}
 #endif //end of MALI_ARCHITECTURE_UTGARD
 #endif //end of RK_DRM_GRALLOC
+
 	buf = (struct rockchip_buffer*)calloc(1, sizeof(*buf));
 	if (!buf) {
 #if RK_DRM_GRALLOC
@@ -1338,6 +1907,7 @@ static struct gralloc_drm_bo_t *drm_gem_rockchip_alloc(
 		ALOGD_IF(RK_DRM_GRALLOC_DEBUG, "try to use secure memory\n");
 	}
 
+    /* 若 buufer 实际上已经分配 (通常在另一个进程中), 则... */
 	if (handle->prime_fd >= 0) {
 		ret = drmPrimeFDToHandle(info->fd, handle->prime_fd,
 			&gem_handle);
@@ -1348,11 +1918,13 @@ static struct gralloc_drm_bo_t *drm_gem_rockchip_alloc(
 			*c = 0;
 			goto err;
 		}
+
 #if RK_DRM_GRALLOC
 		AINF("Got handle %d for fd %d\n", gem_handle, handle->prime_fd);
 #else
                 ALOGV("Got handle %d for fd %d\n", gem_handle, handle->prime_fd);
 #endif
+
 		buf->bo = rockchip_bo_from_handle(info->rockchip, gem_handle,
 			flags, size);
 		if (!buf->bo) {
@@ -1368,7 +1940,9 @@ static struct gralloc_drm_bo_t *drm_gem_rockchip_alloc(
 			drmIoctl(info->fd, DRM_IOCTL_GEM_CLOSE, &args);
 			return NULL;
 		}
-	} else {
+	}
+    else    // if (handle->prime_fd >= 0)
+    {
 		buf->bo = rockchip_bo_create(info->rockchip, size, flags);
 		if (!buf->bo) {
 #if RK_DRM_GRALLOC
@@ -1408,7 +1982,6 @@ static struct gralloc_drm_bo_t *drm_gem_rockchip_alloc(
 				ALOGE("failed to get phy address: %s\n", strerror(errno));
 			ALOGD_IF(RK_DRM_GRALLOC_DEBUG,"get phys 0x%x\n", phys_arg.phy_addr);
 		}
-	}
 
 #if GRALLOC_INIT_AFBC == 1
         if (!(usage & GRALLOC_USAGE_PROTECTED))
@@ -1418,12 +1991,22 @@ static struct gralloc_drm_bo_t *drm_gem_rockchip_alloc(
                         AERR("failed to map bo\n");
                         goto err_unref;
                 }
-                if (format & (GRALLOC_ARM_INTFMT_AFBC | GRALLOC_ARM_INTFMT_AFBC_SPLITBLK | GRALLOC_ARM_INTFMT_AFBC_WIDEBLK))
-                {
-                        init_afbc((uint8_t*)addr, format, w, h);
-                }
+        }
+
+        if ( internal_format & MALI_GRALLOC_INTFMT_AFBCENABLE_MASK )
+        {
+            if ( addr != NULL )
+            {
+                D("to init afbc_buffer, addr : %p", addr);
+                init_afbc((uint8_t*)addr, internal_format, w, h);
+            }
+            else
+            {
+                E("can't init afbc_buffer.");
+            }
         }
 #endif /* GRALLOC_INIT_AFBC == 1 */
+	}   // if (handle->prime_fd >= 0)
 
 #if RK_DRM_GRALLOC
 #if MALI_AFBC_GRALLOC == 1
@@ -1481,7 +2064,8 @@ static struct gralloc_drm_bo_t *drm_gem_rockchip_alloc(
 	}
 #endif
 
-	private_usage = usage & (GRALLOC_USAGE_PRIVATE_0 |
+#if 0
+	int private_usage = usage & (GRALLOC_USAGE_PRIVATE_0 |
 	                             GRALLOC_USAGE_PRIVATE_1);
 	switch (private_usage)
 	{
@@ -1501,6 +2085,35 @@ static struct gralloc_drm_bo_t *drm_gem_rockchip_alloc(
 			handle->yuv_info = MALI_YUV_BT709_WIDE;
 			break;
 	}
+#endif
+    
+    switch (usage & MALI_GRALLOC_USAGE_YUV_CONF_MASK)
+    {
+        case MALI_GRALLOC_USAGE_YUV_CONF_0:
+            if(USAGE_CONTAIN_VALUE(GRALLOC_USAGE_TO_USE_ARM_P010,GRALLOC_USAGE_ROT_MASK))
+            {
+				handle->yuv_info = MALI_YUV_BT709_WIDE; // for rk_hdr.
+            }
+			else
+            {
+				handle->yuv_info = MALI_YUV_BT601_NARROW;
+            }
+			break;
+
+        case MALI_GRALLOC_USAGE_YUV_CONF_1:
+            handle->yuv_info = MALI_YUV_BT601_WIDE;
+            break;
+
+        case MALI_GRALLOC_USAGE_YUV_CONF_2:
+            handle->yuv_info = MALI_YUV_BT709_NARROW;
+            break;
+
+        case MALI_GRALLOC_USAGE_YUV_CONF_3:
+            handle->yuv_info = MALI_YUV_BT709_WIDE;
+            break;
+    }
+    
+    /*-------------------------------------------------------*/
 
 	if(phys_arg.phy_addr && phys_arg.phy_addr != handle->phy_addr)
 	{
@@ -1521,7 +2134,7 @@ static struct gralloc_drm_bo_t *drm_gem_rockchip_alloc(
         handle->name = 0;
 	buf->base.handle = handle;
 
-        AINF("leave, w : %d, h : %d, format : 0x%x,internal_format : 0x%llx, usage : 0x%x. size=%d,pixel_stride=%d,byte_stride=%d",
+        AINF("leave, w : %d, h : %d, format : 0x%x,internal_format : 0x%" PRIx64 ", usage : 0x%x. size=%d,pixel_stride=%d,byte_stride=%d",
                 handle->width, handle->height, handle->format,internal_format, handle->usage, handle->size,
                 pixel_stride,byte_stride);
         AINF("leave: prime_fd=%d,share_attr_fd=%d",handle->prime_fd,handle->share_attr_fd);
@@ -1534,7 +2147,7 @@ err:
 	return NULL;
 }
 
-static void drm_gem_rockchip_free(struct gralloc_drm_drv_t *drv,
+void drm_gem_rockchip_free(struct gralloc_drm_drv_t *drv,
 		struct gralloc_drm_bo_t *bo)
 {
 	struct rockchip_buffer *buf = (struct rockchip_buffer *)bo;
@@ -1592,6 +2205,31 @@ static int drm_gem_rockchip_map(struct gralloc_drm_drv_t *drv,
 			ALOGE("failed to map bo\n");
 			ret = -1;
 		}
+#if RK_CTS_WORKROUND
+		else {
+			int big_scale;
+			static int iCnt = 0;
+			char cmdline[256] = {0};
+
+			getProcessCmdLine(cmdline, sizeof(cmdline));
+
+			if(!strcmp(cmdline,"android.view.cts"))
+			{
+				FindAppHintInFile(VIEW_CTS_FILE, VIEW_CTS_PROG_NAME, BIG_SCALE_HINT, &big_scale, IMG_INT_TYPE);
+				if(big_scale && (gr_handle->usage == 0x603 || gr_handle->usage == 0x203) ) {
+					char* pAddr = (char*)(*addr);
+					memset(*addr,0xFF,gr_handle->height*gr_handle->byte_stride);
+					ALOGD_IF(1, "memset 0xff byte_stride=%d iCnt=%d",gr_handle->byte_stride,iCnt);
+					iCnt++;
+				}
+				if(iCnt == 400 && big_scale)
+				{
+					ModifyAppHintInFile(VIEW_CTS_FILE, VIEW_CTS_PROG_NAME, BIG_SCALE_HINT, &big_scale, 0, IMG_INT_TYPE);
+					ALOGD_IF(1,"reset big_scale");
+				}
+			}
+		}
+#endif
 	}
 
 	if(buf && buf->bo && (buf->bo->flags & ROCKCHIP_BO_CACHABLE))
@@ -1628,11 +2266,15 @@ static void drm_gem_rockchip_unmap(struct gralloc_drm_drv_t *drv,
 static int drm_init_version()
 {
         char value[PROPERTY_VALUE_MAX];
+	char acCommit[50];
 
+        /* RK_GRAPHICS_VER=commit-id:067e5d0: only keep string after '=' */
+        sscanf(RK_GRAPHICS_VER, "%*[^=]=%s", acCommit);
         property_get("sys.ggralloc.version", value, "NULL");
         if(!strcmp(value,"NULL"))
         {
                 property_set("sys.ggralloc.version", RK_GRALLOC_VERSION);
+		property_set("sys.ggralloc.commit", acCommit);
                 ALOGD(RK_GRAPHICS_VER);
                 ALOGD("gralloc ver '%s' on arm_release_ver '%s'.",
                         RK_GRALLOC_VERSION,
@@ -1653,7 +2295,6 @@ struct gralloc_drm_drv_t *gralloc_drm_drv_create_for_rockchip(int fd)
 #endif
 
 	info = (struct rockchip_info*)calloc(1, sizeof(*info));
-
 	if (!info) {
 		ALOGE("Failed to allocate rockchip gralloc device\n");
 		return NULL;

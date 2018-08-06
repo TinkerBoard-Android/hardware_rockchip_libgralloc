@@ -24,11 +24,14 @@
 #ifndef _GRALLOC_DRM_HANDLE_H_
 #define _GRALLOC_DRM_HANDLE_H_
 
-//#include <system/window.h>
 #include <cutils/native_handle.h>
 #include <system/graphics.h>
 #include <hardware/gralloc.h>
-#include "format_chooser.h"
+
+#include "mali_gralloc_usages.h"
+#include "mali_gralloc_formats.h"
+#include "mali_gralloc_private_interface_types.h"
+
 
 #ifdef __cplusplus
 extern "C" {
@@ -36,15 +39,6 @@ extern "C" {
 
 #if RK_DRM_GRALLOC
 #define GRALLOC_UN_USED(arg)     (arg=arg)
-typedef enum
-{
-	MALI_YUV_NO_INFO,
-	MALI_YUV_BT601_NARROW,
-	MALI_YUV_BT601_WIDE,
-	MALI_YUV_BT709_NARROW,
-	MALI_YUV_BT709_WIDE
-} mali_gralloc_yuv_info;
-
 typedef enum
 {
 	MALI_DPY_TYPE_UNKNOWN = 0,
@@ -76,6 +70,35 @@ typedef enum
 
 #endif
 
+/*-----------------------------------*/
+
+/* for building midgard_mali_so in Android 8.x. */
+#ifndef USE_HWC2
+#if PLATFORM_SDK_VERSION >= 26
+#define USE_HWC2
+#endif
+#endif
+
+/*-----------------------------------*/
+
+#if PLATFORM_SDK_VERSION >= 26
+
+#ifndef RK_DRM_GRALLOC
+#error
+#endif
+
+#ifndef MALI_AFBC_GRALLOC
+#error
+#endif
+
+#ifndef USE_HWC2
+#error
+#endif
+
+#endif // #if PLATFORM_SDK_VERSION >= 26
+
+/*-----------------------------------*/
+
 struct gralloc_drm_bo_t;
 
 struct gralloc_drm_handle_t {
@@ -106,6 +129,9 @@ struct gralloc_drm_handle_t {
                 off_t    offset;
                 uint64_t padding4;
         };
+
+    uint64_t consumer_usage;
+    uint64_t producer_usage;
 
 #if MALI_AFBC_GRALLOC == 1
 	// locally mapped shared attribute area
@@ -194,7 +220,7 @@ static inline struct gralloc_drm_handle_t *gralloc_drm_handle(buffer_handle_t _h
 				GRALLOC_DRM_HANDLE_MAGIC);
 		handle = NULL;
 	}
-
+	pthread_mutex_unlock(&handle_mutex);
 	return handle;
 }
 
@@ -202,6 +228,7 @@ static inline void gralloc_drm_unlock_handle(buffer_handle_t _handle)
 {
 	struct gralloc_drm_handle_t *handle = (struct gralloc_drm_handle_t *) _handle;
 
+	pthread_mutex_lock(&handle_mutex);
 	if(handle)
 	{
 		handle->ref--;
